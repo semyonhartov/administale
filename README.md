@@ -97,7 +97,7 @@ python main.py
 
 ### Полезные ссылки
 
-- Релизы: `нам было лень билдить до курсача`
+- Релизы: [`Последний`](https://github.com/semyonhartov/progeng/releases/latest)
 - Документация разработчика: [`docs/development.md`](docs/development.md)
 
 ### Команда
