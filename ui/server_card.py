@@ -75,14 +75,14 @@ class ServerCard(CardWidget):
         btn_layout = QHBoxLayout()
 
         self.toggle_btn = PrimaryPushButton("Запустить" if self.server.status != ServerStatus.RUNNING else "Остановить")
-        self.toggle_btn.setFixedWidth(100)
+        self.toggle_btn.setFixedSize(100, 32)
         self.toggle_btn.clicked.connect(self._on_toggle)
         btn_layout.addWidget(self.toggle_btn)
 
         btn_layout.addStretch()
 
         self.edit_btn = PushButton("Управление")
-        self.edit_btn.setFixedWidth(100)
+        self.edit_btn.setFixedSize(100, 32)
         self.edit_btn.clicked.connect(lambda: self.doubleClicked.emit(self.server.id))
         btn_layout.addWidget(self.edit_btn)
 

@@ -94,7 +94,7 @@ class CreateInstanceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Новый инстанс Hytale")
-        self.setFixedSize(500, 420)
+        self.setFixedSize(500, 516)
         self._setup_content()
 
     def _setup_content(self):
@@ -306,7 +306,7 @@ class RemoteConnectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Подключение к внешнему инстансу")
-        self.setFixedSize(460, 360)
+        self.setFixedSize(460, 500)
         self._setup_content()
 
     def _setup_content(self):
@@ -380,6 +380,7 @@ class RemoteUsersDialog(QDialog):
             f"Подключение владельца: используйте IP этого ПК и порт {self.remote_port}. ID инстанса: {self.server.id}"
         )
         info.setWordWrap(True)
+        info.setStyleSheet("background: transparent;")
         layout.addWidget(info)
 
         self.table = QTableWidget()
@@ -391,6 +392,7 @@ class RemoteUsersDialog(QDialog):
         layout.addWidget(self.table)
 
         form = CardWidget()
+        form.setStyleSheet("background: transparent;")
         form_layout = QFormLayout(form)
         self.username_edit = LineEdit()
         self.password_edit = PasswordLineEdit()
@@ -400,6 +402,7 @@ class RemoteUsersDialog(QDialog):
         self.permission_checks = {}
         for permission, label in REMOTE_PERMISSION_GROUPS.items():
             check = CheckBox(label)
+            check.setStyleSheet("background: transparent;")
             self.permission_checks[permission] = check
             form_layout.addRow(check)
         layout.addWidget(form)

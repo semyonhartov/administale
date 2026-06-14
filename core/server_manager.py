@@ -110,6 +110,7 @@ class ServerInstance:
     remote_host: Optional[str] = None
     remote_port: Optional[int] = None
     remote_username: Optional[str] = None
+    remote_password: Optional[str] = None
     remote_token: Optional[str] = None
     remote_permissions: List[str] = field(default_factory=list)
 
@@ -306,6 +307,7 @@ class ServerManager:
         port: int,
         owner_instance_id: str,
         username: str,
+        password: Optional[str] = None,
         token: Optional[str] = None,
         permissions: Optional[List[str]] = None,
     ) -> ServerInstance:
@@ -328,6 +330,7 @@ class ServerManager:
             remote_host=host,
             remote_port=port,
             remote_username=username,
+            remote_password=password,
             remote_token=token,
             remote_permissions=list(permissions or []),
         )

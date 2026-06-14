@@ -432,6 +432,7 @@ class MainWindow(QMainWindow):
                 port=data["port"],
                 owner_instance_id=data["server_id"],
                 username=data["username"],
+                password=data["password"],
                 token=result.get("token"),
                 permissions=result.get("permissions", []),
             )

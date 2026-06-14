@@ -3,6 +3,7 @@
 Содержит вкладки: Главная, Консоль, Модификации, Настройки, Файлы, Бэкапы.
 """
 import asyncio
+import base64
 from collections import deque
 import datetime
 import json
@@ -54,6 +55,21 @@ def _is_remote_tab_allowed(server: ServerInstance, tab_permission: str, action_p
     return False
 
 
+def _apply_remote_identity(target: ServerInstance, source: ServerInstance) -> ServerInstance:
+    source.is_remote = True
+    source.remote_host = target.remote_host
+    source.remote_port = target.remote_port
+    source.remote_token = target.remote_token
+    source.remote_permissions = list(target.remote_permissions)
+    source.owner_instance_id = target.owner_instance_id
+    source.remote_username = target.remote_username
+    source.remote_password = target.remote_password
+    source.id = target.id
+    source.slug = target.slug
+    source.path = target.path
+    return source
+
+
 # =============================================================================
 # ВКЛАДКА: ГЛАВНАЯ
 # =============================================================================
@@ -102,13 +118,8 @@ class HomeTab(QWidget):
         self.restart_btn.clicked.connect(self._restart_server)
         actions.addWidget(self.restart_btn)
 
-        self.stop_btn = PushButton(FIF.PAUSE, "Остановить")
-        self.stop_btn.clicked.connect(self._stop_server)
-        actions.addWidget(self.stop_btn)
-
         self.start_btn.setVisible(_has_remote_permission(self.server, "server.start") or _has_remote_permission(self.server, "server.stop"))
         self.restart_btn.setVisible(_has_remote_permission(self.server, "server.restart"))
-        self.stop_btn.setVisible(_has_remote_permission(self.server, "server.stop"))
 
         status_layout.addLayout(actions)
         layout.addWidget(status_card)
@@ -167,26 +178,14 @@ class HomeTab(QWidget):
 
         if proc and proc.state == ProcessState.RUNNING:
             if self.server.is_remote:
-                self.remote_access_service.api_post(
-                    self.server.remote_host,
-                    self.server.remote_port,
-                    self.server.remote_token,
-                    "/api/action",
-                    {"action": "server.stop"},
-                )
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "server.stop"})
             else:
                 asyncio.run_coroutine_threadsafe(self.process_manager.stop_server(self.server.id), loop)
         else:
             dashboard = self.window()
             auth_cb = getattr(dashboard, "_handle_auth_link", None)
             if self.server.is_remote:
-                self.remote_access_service.api_post(
-                    self.server.remote_host,
-                    self.server.remote_port,
-                    self.server.remote_token,
-                    "/api/action",
-                    {"action": "server.start"},
-                )
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "server.start"})
             else:
                 asyncio.run_coroutine_threadsafe(self.process_manager.start_server(self.server, auth_link_callback=auth_cb), loop)
         self.refresh()
@@ -197,21 +196,9 @@ class HomeTab(QWidget):
 
         async def restart():
             if self.server.is_remote:
-                self.remote_access_service.api_post(
-                    self.server.remote_host,
-                    self.server.remote_port,
-                    self.server.remote_token,
-                    "/api/action",
-                    {"action": "server.stop"},
-                )
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "server.stop"})
                 await asyncio.sleep(1)
-                self.remote_access_service.api_post(
-                    self.server.remote_host,
-                    self.server.remote_port,
-                    self.server.remote_token,
-                    "/api/action",
-                    {"action": "server.start"},
-                )
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "server.start"})
             else:
                 await self.process_manager.stop_server(self.server.id)
                 await asyncio.sleep(1)
@@ -226,13 +213,7 @@ class HomeTab(QWidget):
         import asyncio
         loop = self.process_manager._event_loop
         if self.server.is_remote:
-            self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "server.stop"},
-            )
+            self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "server.stop"})
         else:
             asyncio.run_coroutine_threadsafe(self.process_manager.stop_server(self.server.id), loop)
         self.refresh()
@@ -244,6 +225,11 @@ class HomeTab(QWidget):
 
         proc = self.process_manager.get_process(self.server.id)
         usage = self.process_manager.get_resource_usage(self.server.id)
+        if self.server.is_remote:
+            dashboard = self.window()
+            snapshot = getattr(dashboard, "_remote_snapshot_cache", None) if dashboard else None
+            if snapshot:
+                usage = snapshot.get("usage", usage)
         if proc:
             is_running = proc.state == ProcessState.RUNNING
             self.status_title.setText(f"Статус: {srv.status.value}")
@@ -320,8 +306,12 @@ class ConsoleTab(QWidget):
         self.current_filter = "all"
         self._log_buffer = deque(maxlen=100000)
         self._processed_log_count = 0
+        self._last_remote_log_signature = None
         self._log_revision = 0
         self._command_paths = []
+        self._command_cache_path = Path(server.path) / ".remote_commands_dump.json"
+        self._remote_poll_ts = 0.0
+        self._remote_poll_cache = None
         self.macros_bar_widget = None
         self._setup_ui()
         self._start_log_reader()
@@ -462,13 +452,7 @@ class ConsoleTab(QWidget):
             return
 
         if self.server.is_remote:
-            response = self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "console.macro.add", "name": name.strip(), "command": cmd.strip()},
-            )
+            response = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "console.macro.add", "name": name.strip(), "command": cmd.strip()})
             self.server.macros = response.get("macros", [])
         else:
             mgr = ServerManager()
@@ -484,13 +468,7 @@ class ConsoleTab(QWidget):
         action = menu.exec(global_pos)
         if action == delete_action:
             if self.server.is_remote:
-                response = self.remote_access_service.api_post(
-                    self.server.remote_host,
-                    self.server.remote_port,
-                    self.server.remote_token,
-                    "/api/action",
-                    {"action": "console.macro.delete", "index": index},
-                )
+                response = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "console.macro.delete", "index": index})
                 self.server.macros = response.get("macros", [])
             else:
                 mgr = ServerManager()
@@ -512,33 +490,29 @@ class ConsoleTab(QWidget):
             return
         if self.server.is_remote:
             try:
-                dashboard = self.window()
-                if hasattr(dashboard, "_remote_snapshot_cache") and dashboard._remote_snapshot_cache:
-                    snapshot = dashboard._remote_snapshot_cache
-                else:
-                    snapshot = self.remote_access_service.api_get(
-                        self.server.remote_host,
-                        self.server.remote_port,
-                        self.server.remote_token,
-                        "/api/state",
-                    )
+                import time
+
+                if not self._remote_poll_cache or time.time() - self._remote_poll_ts >= 1:
+                    self._remote_poll_cache = self.remote_access_service.api_get_for_server(self.server, "/api/state")
+                    self._remote_poll_ts = time.time()
+                snapshot = self._remote_poll_cache
                 remote_server = snapshot.get("server")
                 if remote_server:
-                    self.server = ServerInstance.from_dict(remote_server)
-                    self.server.is_remote = True
-                    self.server.remote_host = self.parent().server.remote_host if self.parent() else self.server.remote_host
-                    self.server.remote_port = self.parent().server.remote_port if self.parent() else self.server.remote_port
-                    self.server.remote_token = self.parent().server.remote_token if self.parent() else self.server.remote_token
-                    self.server.remote_permissions = self.parent().server.remote_permissions if self.parent() else self.server.remote_permissions
+                    self.server = _apply_remote_identity(self.server, ServerInstance.from_dict(remote_server))
                 self.server.macros = snapshot.get("macros", getattr(self.server, "macros", []))
-                self._command_paths = sorted({item.get("name", "").strip() for item in (snapshot.get("commands_dump") or {}).get("modern", []) if item.get("name")})
+                commands_dump = snapshot.get("commands_dump") or self._load_cached_remote_commands_dump()
+                if snapshot.get("commands_dump"):
+                    self._store_cached_remote_commands_dump(snapshot.get("commands_dump"))
+                self._command_paths = sorted({item.get("name", "").strip() for item in (commands_dump or {}).get("modern", []) if item.get("name")})
                 logs = snapshot.get("logs", [])
-                if len(logs) != self._processed_log_count:
+                log_signature = (len(logs), logs[-1] if logs else "", logs[0] if logs else "")
+                if log_signature != self._last_remote_log_signature:
                     self._clear_logs(clear_process_buffer=False)
                     for line in logs:
                         category = self._categorize_log(line)
                         self._append_log(line, category, render=False)
                     self._processed_log_count = len(logs)
+                    self._last_remote_log_signature = log_signature
                     self._refresh_macro_buttons()
                     self._render_logs()
             except Exception:
@@ -592,6 +566,9 @@ class ConsoleTab(QWidget):
         self.log_view.clear()
         self._log_buffer.clear()
         self._processed_log_count = 0
+        self._last_remote_log_signature = None
+        self._remote_poll_cache = None
+        self._remote_poll_ts = 0.0
         if clear_process_buffer:
             proc = self.process_manager.get_process(self.server.id)
             if proc:
@@ -614,13 +591,7 @@ class ConsoleTab(QWidget):
 
         import asyncio
         if self.server.is_remote:
-            self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "console.command", "command": cmd},
-            )
+            self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "console.command", "command": cmd})
         else:
             loop = self.process_manager._event_loop
             asyncio.run_coroutine_threadsafe(self.process_manager.send_command(self.server.id, cmd), loop)
@@ -671,6 +642,9 @@ class ConsoleTab(QWidget):
 
     def _load_command_suggestions(self):
         if self.server.is_remote:
+            dump = self._load_cached_remote_commands_dump()
+            if dump:
+                self._command_paths = sorted({item.get("name", "").strip() for item in dump.get("modern", []) if item.get("name")})
             return
         dump_path = Path(self.server.path) / "Server" / "dumps" / "commands.dump.json"
         if not dump_path.exists():
@@ -711,6 +685,23 @@ class ConsoleTab(QWidget):
             if path_parts[len(parts) - 1].lower().startswith(last_part):
                 results.append(" ".join(path_parts[:len(parts)]))
         return sorted(set(results))[:50]
+
+    def _store_cached_remote_commands_dump(self, data: dict):
+        try:
+            self._command_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._command_cache_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_cached_remote_commands_dump(self) -> Optional[dict]:
+        if not self._command_cache_path.exists():
+            return None
+        try:
+            with open(self._command_cache_path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
 
 
 # =============================================================================
@@ -809,12 +800,7 @@ class ModsTab(QWidget):
         self.table.setRowCount(0)
 
         if self.server.is_remote:
-            snapshot = self.remote_access_service.api_get(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/state",
-            )
+            snapshot = self.remote_access_service.api_get_for_server(self.server, "/api/state")
             remote_mods = snapshot.get("mods", [])
             enabled_mods = [mod for mod in remote_mods if mod.get("enabled", True)]
             disabled_mods = [mod for mod in remote_mods if not mod.get("enabled", True)]
@@ -876,13 +862,7 @@ class ModsTab(QWidget):
             self.table.setCellWidget(row, 4, actions_widget)
 
     def _disable_mod(self, file_name: str):
-        ok = self.remote_access_service.api_post(
-            self.server.remote_host,
-            self.server.remote_port,
-            self.server.remote_token,
-            "/api/action",
-            {"action": "mods.toggle", "file_name": file_name, "enabled": False},
-        ).get("ok") if self.server.is_remote else self.mod_manager.disable_mod(file_name)
+        ok = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "mods.toggle", "file_name": file_name, "enabled": False}).get("ok") if self.server.is_remote else self.mod_manager.disable_mod(file_name)
         if ok:
             InfoBar.success("Мод отключён", file_name, duration=2000, parent=self)
             self._load_mods()
@@ -890,13 +870,7 @@ class ModsTab(QWidget):
             InfoBar.error("Ошибка", "Не удалось отключить мод", duration=2000, parent=self)
 
     def _enable_mod(self, file_name: str):
-        ok = self.remote_access_service.api_post(
-            self.server.remote_host,
-            self.server.remote_port,
-            self.server.remote_token,
-            "/api/action",
-            {"action": "mods.toggle", "file_name": file_name, "enabled": True},
-        ).get("ok") if self.server.is_remote else self.mod_manager.enable_mod(file_name)
+        ok = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "mods.toggle", "file_name": file_name, "enabled": True}).get("ok") if self.server.is_remote else self.mod_manager.enable_mod(file_name)
         if ok:
             InfoBar.success("Мод включён", file_name, duration=2000, parent=self)
             self._load_mods()
@@ -909,13 +883,7 @@ class ModsTab(QWidget):
         msg.setText(f"Удалить мод {file_name}?")
         msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         if msg.exec() == QMessageBox.Yes:
-            ok = self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "mods.delete", "file_name": file_name},
-            ).get("ok") if self.server.is_remote else self.mod_manager.delete_mod(file_name)
+            ok = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "mods.delete", "file_name": file_name}).get("ok") if self.server.is_remote else self.mod_manager.delete_mod(file_name)
             if ok:
                 InfoBar.success("Удалено", file_name, duration=2000, parent=self)
                 self._load_mods()
@@ -953,21 +921,15 @@ class ModsTab(QWidget):
                     if isinstance(file_date, str):
                         file_date = int(datetime.datetime.fromisoformat(file_date.replace("Z", "+00:00")).timestamp() * 1000)
 
-                    result = self.remote_access_service.api_post(
-                        self.server.remote_host,
-                        self.server.remote_port,
-                        self.server.remote_token,
-                        "/api/action",
-                        {
-                            "action": "mods.install",
-                            "mod_id": mod_id,
-                            "file_id": file_id,
-                            "file_name": file_name,
-                            "file_date": file_date,
-                            "slug": slug,
-                            "mod_name": mod_name,
-                        },
-                    )
+                    result = self.remote_access_service.api_post_for_server(self.server, "/api/action", {
+                        "action": "mods.install",
+                        "mod_id": mod_id,
+                        "file_id": file_id,
+                        "file_name": file_name,
+                        "file_date": file_date,
+                        "slug": slug,
+                        "mod_name": mod_name,
+                    })
                     if result.get("ok"):
                         browser.mod_installed.emit(file_name)
                         browser._set_status_signal.emit(f"Установлен: {mod_name}")
@@ -979,6 +941,9 @@ class ModsTab(QWidget):
             browser._install_mod = remote_install
             browser._open_mods_folder_signal.disconnect()
             browser._open_mods_folder_signal.connect(lambda: InfoBar.info("Недоступно", "Для внешнего инстанса локальная папка модов владельца не открывается", duration=3000, parent=self))
+            for button in browser.findChildren(PushButton):
+                if button.text() == "Открыть папку с модами":
+                    button.setVisible(False)
             browser.mod_installed.connect(self._load_mods)
             browser.exec()
             return
@@ -1265,13 +1230,7 @@ class SettingsTab(QWidget):
         wc.gameplay_config = self.gameplay_combo.currentText()
 
         if self.server.is_remote:
-            self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "settings.edit", "server": self.server.to_dict()},
-            )
+            self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "settings.edit", "server": self.server.to_dict()})
         else:
             ServerManager().update_server(self.server)
 
@@ -1282,7 +1241,8 @@ class SettingsTab(QWidget):
                         f.write(f"{arg}\n")
 
         InfoBar.success("Сохранено", "Настройки инстанса обновлены", duration=2000, parent=self)
-        self.refresh_from_server(ServerManager().get_server(self.server.id))
+        if not self.server.is_remote:
+            self.refresh_from_server(ServerManager().get_server(self.server.id))
 
     def _reset(self):
         self.refresh_from_server(ServerManager().get_server(self.server.id) or self.server)
@@ -1326,6 +1286,7 @@ class FilesTab(QWidget):
     def __init__(self, server: ServerInstance, parent=None):
         super().__init__(parent)
         self.server = server
+        self.remote_access_service = RemoteAccessService()
         self.root_path = Path(server.path).resolve()
         self.current_path = self.root_path
         self._setup_ui()
@@ -1353,6 +1314,12 @@ class FilesTab(QWidget):
             return "/" + path.relative_to(self.root_path).as_posix()
         except Exception:
             return "/"
+
+    def _current_remote_path(self) -> str:
+        return self.path_label.text() or "/"
+
+    def _remote_item_path(self, item: QTreeWidgetItem) -> str:
+        return item.data(0, Qt.UserRole) or "/"
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -1383,14 +1350,20 @@ class FilesTab(QWidget):
         tb_layout.addWidget(self.new_folder_btn)
 
         self.upload_btn = PrimaryPushButton(FIF.UP, "Загрузить")
-        self.upload_btn.setFixedWidth(100)
+        self.upload_btn.setFixedWidth(120)
         self.upload_btn.clicked.connect(self._upload)
         tb_layout.addWidget(self.upload_btn)
 
         self.delete_btn = PushButton(FIF.DELETE, "Удалить")
-        self.delete_btn.setFixedWidth(90)
+        self.delete_btn.setFixedWidth(100)
         self.delete_btn.clicked.connect(self._delete_selected)
         tb_layout.addWidget(self.delete_btn)
+
+        if self.server.is_remote:
+            can_write = _has_remote_permission(self.server, "files.write")
+            self.new_folder_btn.setVisible(can_write)
+            self.upload_btn.setVisible(can_write)
+            self.delete_btn.setVisible(can_write)
 
         layout.addWidget(toolbar)
 
@@ -1426,10 +1399,29 @@ class FilesTab(QWidget):
 
     def _load_directory(self):
         self.tree.clear()
+        if self.server.is_remote:
+            try:
+                response = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "files.list", "path": self._current_remote_path()})
+                current_path = response.get("path") or "/"
+                self.path_label.setText(current_path)
+                self.up_btn.setEnabled(current_path != "/")
+                for item in response.get("files", []):
+                    size = self._format_size(item.get("size", 0)) if not item.get("is_dir") else "—"
+                    mtime = datetime.datetime.fromtimestamp(item.get("mtime", 0)).strftime("%d.%m.%Y %H:%M")
+                    item_type = "Папка" if item.get("is_dir") else self._get_file_type(Path(item.get("name", "")).suffix)
+                    tree_item = QTreeWidgetItem(self.tree, [item.get("name", ""), size, item_type, mtime])
+                    tree_item.setData(0, Qt.UserRole, item.get("path", "/"))
+                return
+            except Exception as e:
+                self.up_btn.setEnabled(False)
+                InfoBar.error("Ошибка файлов", str(e), duration=3500, parent=self)
+                return
+
         self.current_path = self.current_path.resolve()
         if not self._is_allowed_path(self.current_path):
             self.current_path = self.root_path
         self.path_label.setText(self._display_path(self.current_path))
+        self.up_btn.setEnabled(self.current_path != self.root_path)
 
         try:
             items = sorted(self.current_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
@@ -1453,12 +1445,23 @@ class FilesTab(QWidget):
             pass
 
     def _go_up(self):
+        if self.server.is_remote:
+            current = Path(self._current_remote_path())
+            parent = current.parent.as_posix()
+            self.path_label.setText(parent if parent.startswith("/") else f"/{parent}" if parent != "." else "/")
+            self._load_directory()
+            return
         parent = self.current_path.parent
         if parent != self.current_path and self._is_allowed_path(parent):
             self.current_path = parent
             self._load_directory()
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        if self.server.is_remote:
+            if item.text(2) == "Папка":
+                self.path_label.setText(self._remote_item_path(item))
+                self._load_directory()
+            return
         path = Path(item.data(0, Qt.UserRole)).resolve()
         if self._is_allowed_path(path) and path.is_dir():
             self.current_path = path
@@ -1469,8 +1472,8 @@ class FilesTab(QWidget):
         if not item:
             return
 
-        path = Path(item.data(0, Qt.UserRole)).resolve()
-        if not self._is_allowed_path(path):
+        path = self._remote_item_path(item) if self.server.is_remote else Path(item.data(0, Qt.UserRole)).resolve()
+        if not self.server.is_remote and not self._is_allowed_path(path):
             InfoBar.error("Доступ запрещён", "Операция за пределами инстанса запрещена", duration=2500, parent=self)
             return
 
@@ -1480,16 +1483,18 @@ class FilesTab(QWidget):
             QMenu::item:selected { background-color: #3a3a3a; }
         """)
 
-        open_action = menu.addAction("Открыть")
-        open_action.triggered.connect(lambda: self._open_in_explorer(path))
+        if not self.server.is_remote:
+            open_action = menu.addAction("Открыть")
+            open_action.triggered.connect(lambda: self._open_in_explorer(path))
 
-        if path.is_dir():
+        if (self.server.is_remote and item.text(2) == "Папка") or (not self.server.is_remote and path.is_dir()):
             enter_action = menu.addAction("Открыть папку")
             enter_action.triggered.connect(lambda: self._enter_directory(path))
 
-        menu.addSeparator()
-        delete_action = menu.addAction("Удалить")
-        delete_action.triggered.connect(lambda: self._delete_item(path))
+        if not self.server.is_remote or _has_remote_permission(self.server, "files.write"):
+            menu.addSeparator()
+            delete_action = menu.addAction("Удалить")
+            delete_action.triggered.connect(lambda: self._delete_item(path))
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
@@ -1497,11 +1502,25 @@ class FilesTab(QWidget):
         InfoBar.info("Ограничение безопасности", "Открытие внешнего проводника отключено для защиты файловой системы", duration=3500, parent=self)
 
     def _enter_directory(self, path: Path):
+        if self.server.is_remote:
+            self.path_label.setText(str(path))
+            self._load_directory()
+            return
         if self._is_allowed_path(path) and path.is_dir():
             self.current_path = path
             self._load_directory()
 
     def _delete_item(self, path: Path):
+        if self.server.is_remote:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Удаление")
+            msg.setText(f"Удалить {Path(str(path)).name}?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            if msg.exec() == QMessageBox.Yes:
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "files.delete", "path": str(path)})
+                self._load_directory()
+                InfoBar.success("Удалено", Path(str(path)).name, duration=2000, parent=self)
+            return
         path = path.resolve()
         if not self._is_allowed_path(path):
             InfoBar.error("Доступ запрещён", "Удаление за пределами инстанса запрещено", duration=2500, parent=self)
@@ -1524,12 +1543,19 @@ class FilesTab(QWidget):
             InfoBar.warning("Ничего не выбрано", "Выберите файл или папку для удаления", duration=2000, parent=self)
             return
         for item in items:
-            path = Path(item.data(0, Qt.UserRole)).resolve()
+            path = self._remote_item_path(item) if self.server.is_remote else Path(item.data(0, Qt.UserRole)).resolve()
             self._delete_item(path)
 
     def _new_folder(self):
         name, ok = QInputDialog.getText(self, "Новая папка", "Имя папки:")
         if ok and name:
+            if self.server.is_remote:
+                current = self._current_remote_path().rstrip("/") or "/"
+                remote_path = f"{current}/{name}" if current != "/" else f"/{name}"
+                self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "files.mkdir", "path": remote_path})
+                self._load_directory()
+                InfoBar.success("Создано", name, duration=2000, parent=self)
+                return
             new_path = self._safe_join_current(name)
             if new_path is None:
                 InfoBar.error("Доступ запрещён", "Нельзя создавать папки вне директории инстанса", duration=2500, parent=self)
@@ -1541,6 +1567,17 @@ class FilesTab(QWidget):
     def _upload(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Загрузить файлы", "", "Все файлы (*.*)")
         if paths:
+            if self.server.is_remote:
+                current = self._current_remote_path().rstrip("/") or "/"
+                for path in paths:
+                    file_name = Path(path).name
+                    remote_path = f"{current}/{file_name}" if current != "/" else f"/{file_name}"
+                    with open(path, "rb") as fh:
+                        encoded = base64.b64encode(fh.read()).decode("ascii")
+                    self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "files.upload", "path": remote_path, "content_base64": encoded})
+                self._load_directory()
+                InfoBar.success("Загрузка завершена", f"Загружено {len(paths)} файл(ов)", duration=2000, parent=self)
+                return
             for path in paths:
                 dest = self._safe_join_current(Path(path).name)
                 if dest is None:
@@ -1663,18 +1700,16 @@ class BackupsTab(QWidget):
         self.server.backup_schedule.interval_minutes = dialog.get_schedule_data()["interval_minutes"]
         self.server.backup_schedule.keep_last = dialog.get_schedule_data()["keep_last"]
         self.server.backup_schedule.config = dialog.get_config()
-        ServerManager().update_server(self.server)
+        if self.server.is_remote:
+            self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "backups.schedule.update", "backup_schedule": self.server.backup_schedule})
+        else:
+            ServerManager().update_server(self.server)
         InfoBar.success("Расписание сохранено", "Настройки автобэкапа обновлены", duration=2500, parent=self)
 
     def _load_backups(self):
         self.table.setRowCount(0)
         if self.server.is_remote:
-            snapshot = self.remote_access_service.api_get(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/state",
-            )
+            snapshot = self.remote_access_service.api_get_for_server(self.server, "/api/state")
             backups = snapshot.get("backups", [])
         else:
             backups = self.backup_manager.list_backups()
@@ -1721,13 +1756,7 @@ class BackupsTab(QWidget):
             asyncio.run_coroutine_threadsafe(self.process_manager.stop_server(self.server.id), loop).result(timeout=60)
 
         if self.server.is_remote:
-            result = self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "backups.create"},
-            )["backup"]
+            result = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "backups.create", "config": config})["backup"]
         else:
             result = self.backup_manager.create_backup(config)
             self.backup_manager.prune_backups(schedule.keep_last)
@@ -1739,7 +1768,8 @@ class BackupsTab(QWidget):
             "included": result.get("included", []),
         })
         self.server.last_backup = result["date"]
-        ServerManager().update_server(self.server)
+        if not self.server.is_remote:
+            ServerManager().update_server(self.server)
 
         if was_running:
             loop = self.process_manager._event_loop
@@ -1768,13 +1798,7 @@ class BackupsTab(QWidget):
             if was_running:
                 loop = self.process_manager._event_loop
                 asyncio.run_coroutine_threadsafe(self.process_manager.stop_server(self.server.id), loop).result(timeout=60)
-            success = self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "backups.restore", "name": name},
-            ).get("ok") if self.server.is_remote else self.backup_manager.restore_backup(name)
+            success = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "backups.restore", "name": name}).get("ok") if self.server.is_remote else self.backup_manager.restore_backup(name)
             if was_running:
                 loop = self.process_manager._event_loop
                 asyncio.run_coroutine_threadsafe(self.process_manager.start_server(self.server), loop)
@@ -1797,13 +1821,7 @@ class BackupsTab(QWidget):
         msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
 
         if msg.exec() == QMessageBox.Yes:
-            ok = self.remote_access_service.api_post(
-                self.server.remote_host,
-                self.server.remote_port,
-                self.server.remote_token,
-                "/api/action",
-                {"action": "backups.delete", "name": name},
-            ).get("ok") if self.server.is_remote else self.backup_manager.delete_backup(name)
+            ok = self.remote_access_service.api_post_for_server(self.server, "/api/action", {"action": "backups.delete", "name": name}).get("ok") if self.server.is_remote else self.backup_manager.delete_backup(name)
             if ok:
                 self.table.removeRow(row)
                 InfoBar.success("Удалено", f"Бэкап {name} удалён", duration=2000, parent=self)
@@ -1856,7 +1874,7 @@ class ServerDashboard(QWidget):
 
         if not self.server.is_remote:
             self.remote_users_btn = PushButton(FIF.PEOPLE, "Пользователи")
-            self.remote_users_btn.setFixedWidth(130)
+            self.remote_users_btn.setFixedWidth(140)
             self.remote_users_btn.clicked.connect(self._manage_remote_users)
             header_layout.addWidget(self.remote_users_btn)
 
@@ -2010,22 +2028,10 @@ class ServerDashboard(QWidget):
                 import time
 
                 if not self._remote_snapshot_cache or time.time() - self._remote_snapshot_cache_ts >= 5:
-                    self._remote_snapshot_cache = self.remote_access_service.api_get(
-                        self.server.remote_host,
-                        self.server.remote_port,
-                        self.server.remote_token,
-                        "/api/state",
-                    )
+                    self._remote_snapshot_cache = self.remote_access_service.api_get_for_server(self.server, "/api/state")
                     self._remote_snapshot_cache_ts = time.time()
                 snapshot = self._remote_snapshot_cache
-                remote_server = ServerInstance.from_dict(snapshot["server"])
-                remote_server.is_remote = True
-                remote_server.remote_host = self.server.remote_host
-                remote_server.remote_port = self.server.remote_port
-                remote_server.remote_token = self.server.remote_token
-                remote_server.remote_permissions = list(self.server.remote_permissions)
-                remote_server.owner_instance_id = self.server.owner_instance_id
-                remote_server.remote_username = self.server.remote_username
+                remote_server = _apply_remote_identity(self.server, ServerInstance.from_dict(snapshot["server"]))
                 self.server = remote_server
                 ServerManager().update_server(self.server)
                 srv = self.server
